@@ -540,7 +540,7 @@ class AirPort:
                 url=self.sub,
                 headers=headers,
                 retry=retry,
-                timeout=30,
+                timeout=120,
                 trace=trace,
                 interval=1,
                 max_size=15 * 1024 * 1024,
@@ -776,6 +776,7 @@ class AirPort:
                 f"{artifact}.txt",
                 f"{artifact}.yaml",
                 "clash",
+                True,
                 True,
                 ignore,
             )
