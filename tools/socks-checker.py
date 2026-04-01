@@ -11,13 +11,15 @@ SOCKS5/HTTP 代理批量检测工具
 
 import argparse
 import asyncio
+import html
 import ipaddress
+import json
 import re
 import sys
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
-from urllib.parse import urlparse
+from typing import Any, Callable, Dict, List, Optional, Tuple
+from urllib.parse import quote, urlparse
 
 import aiohttp
 import yaml
@@ -342,30 +344,87 @@ class IpLookupResult:
     error: Optional[str] = None
 
 
-class IpLibrary:
+class IPLibrary:
     name: str = ""
 
     async def lookup(
         self, session: aiohttp.ClientSession, proxy_info: ProxyInfo, retries: int, timeout: int
     ) -> IpLookupResult:
-        raise NotImplementedError
+        data, error = await self._fetch(session, proxy_info, retries, timeout)
+        if not data:
+            host = "" if not proxy_info else proxy_info.host
+            return IpLookupResult(None, None, error or f"Failed to get IP info from {self.name}, host: {host}")
+
+        return self._verify(data, self.name)
 
     def build_remark(self, data: Dict, include_asn_name: bool) -> str:
         raise NotImplementedError
 
-    async def _make_request(
-        self, session: aiohttp.ClientSession, url: str, retries: int, timeout: int
+    async def _fetch(
+        self, session: aiohttp.ClientSession, proxy_info: ProxyInfo, retries: int, timeout: int
     ) -> Tuple[Optional[Dict], Optional[str]]:
+        raise NotImplementedError
+
+    @staticmethod
+    def _build_headers(url: str) -> Dict[str, str]:
+        result = urlparse(url)
+        base = f"{result.scheme}://{result.netloc}" if result.scheme and result.netloc else ""
+
+        return {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+            "Connection": "close",
+            "Referer": f"{base}/" if base else url,
+            "Origin": base if base else url,
+        }
+
+    async def _make_request(
+        self,
+        session: aiohttp.ClientSession,
+        url: str,
+        retries: int,
+        timeout: int,
+        headers: Optional[Dict[str, str]] = None,
+        deserialize: bool = True,
+        parser: Optional[Callable[[str], Any]] = None,
+    ) -> Tuple[Optional[Any], Optional[str]]:
+        default_headers = self._build_headers(url)
+        if headers and isinstance(headers, dict):
+            default_headers.update({k: v for k, v in headers.items() if k and v is not None})
+
         error = None
         for attempt in range(1, retries + 1):
             try:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as response:
+                async with session.get(
+                    url,
+                    headers=default_headers,
+                    timeout=aiohttp.ClientTimeout(total=timeout),
+                ) as response:
                     if response.status == 200:
-                        data = await response.json()
-                        if isinstance(data, dict):
-                            return data, None
+                        content = await response.text()
 
-                        error = "Invalid JSON response"
+                        if parser is not None:
+                            data = parser(content)
+                            if data:
+                                return data, None
+
+                            error = "Invalid response payload"
+                        elif deserialize:
+                            try:
+                                data = json.loads(content)
+                            except Exception:
+                                data = None
+
+                            if isinstance(data, dict):
+                                return data, None
+
+                            error = "Invalid JSON response"
+                        else:
+                            return content, None
+
                     else:
                         error = f"HTTP {response.status}"
             except asyncio.TimeoutError:
@@ -377,22 +436,6 @@ class IpLibrary:
                 await asyncio.sleep(attempt)
 
         return None, error
-
-    async def _query(
-        self,
-        session: aiohttp.ClientSession,
-        proxy_info: ProxyInfo,
-        retries: int,
-        timeout: int,
-        source: str,
-        fetcher,
-    ) -> IpLookupResult:
-        data, error = await fetcher(session, retries, timeout)
-        if not data:
-            host = "" if not proxy_info else proxy_info.host
-            return IpLookupResult(None, None, error or f"Failed to get IP info from {source}, host: {host}")
-
-        return self._verify(data, source)
 
     @staticmethod
     def _verify(data: Dict, source: str) -> IpLookupResult:
@@ -428,22 +471,8 @@ class IpLibrary:
         return base
 
 
-class IpinfoLibrary(IpLibrary):
+class IPInfoLibrary(IPLibrary):
     name = "ipinfo"
-
-    async def lookup(
-        self, session: aiohttp.ClientSession, proxy_info: ProxyInfo, retries: int, timeout: int
-    ) -> IpLookupResult:
-        host = proxy_info.host if proxy_info else ""
-        address = await self._resolve_ip(session, host, retries, timeout)
-        if not address:
-            return IpLookupResult(None, None, f"Failed to get IP from ipinfo.io/ip, host: {host}")
-
-        data, error = await self._fetch_ipinfo(session, address, retries, timeout)
-        if not data:
-            return IpLookupResult(address, None, error or f"Failed to get IP info from ipinfo.io, ip: {address}")
-
-        return IpLookupResult(address, data, None)
 
     def build_remark(self, data: Dict, include_asn_name: bool) -> str:
         country_code = (data.get("country") or "").upper()
@@ -492,7 +521,11 @@ class IpinfoLibrary(IpLibrary):
         url = "https://ipinfo.io/ip"
         for attempt in range(1, retries + 1):
             try:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as response:
+                async with session.get(
+                    url,
+                    headers=self._build_headers(url),
+                    timeout=aiohttp.ClientTimeout(total=timeout),
+                ) as response:
                     if response.status == 200:
                         text = (await response.text()).strip()
                         try:
@@ -510,31 +543,24 @@ class IpinfoLibrary(IpLibrary):
 
         return None
 
-    async def _fetch_ipinfo(
-        self, session: aiohttp.ClientSession, address: str, retries: int, timeout: int
+    async def _fetch(
+        self, session: aiohttp.ClientSession, proxy_info: ProxyInfo, retries: int, timeout: int
     ) -> Tuple[Optional[Dict], Optional[str]]:
+        host = proxy_info.host if proxy_info else ""
+        address = await self._resolve_ip(session, host, retries, timeout)
+        if not address:
+            return None, f"Failed to get IP from ipinfo.io/ip, host: {host}"
+
         url = f"https://ipinfo.io/widget/demo/{address}"
         data, error = await self._make_request(session, url, retries, timeout)
         if not data:
-            return None, error
+            return None, error or f"Failed to get IP info from ipinfo.io, ip: {address}"
 
         return data.get("data", data), None
 
 
-class IppureLibrary(IpLibrary):
+class IPPureLibrary(IPLibrary):
     name = "ippure"
-
-    async def lookup(
-        self, session: aiohttp.ClientSession, proxy_info: ProxyInfo, retries: int, timeout: int
-    ) -> IpLookupResult:
-        return await self._query(
-            session=session,
-            proxy_info=proxy_info,
-            retries=retries,
-            timeout=timeout,
-            source=self.name,
-            fetcher=self._fetch_ippure,
-        )
 
     def build_remark(self, data: Dict, include_asn_name: bool) -> str:
         residential = data.get("isResidential")
@@ -555,27 +581,100 @@ class IppureLibrary(IpLibrary):
             detail=score,
         )
 
-    async def _fetch_ippure(
-        self, session: aiohttp.ClientSession, retries: int, timeout: int
+    async def _fetch(
+        self, session: aiohttp.ClientSession, _: ProxyInfo, retries: int, timeout: int
     ) -> Tuple[Optional[Dict], Optional[str]]:
         url = "https://my.ippure.com/v1/info"
         return await self._make_request(session, url, retries, timeout)
 
 
-class IPLarkLibrary(IpLibrary):
-    name = "iplark"
+class IP2LocationLibrary(IPLibrary):
+    name = "ip2location"
 
-    async def lookup(
-        self, session: aiohttp.ClientSession, proxy_info: ProxyInfo, retries: int, timeout: int
-    ) -> IpLookupResult:
-        return await self._query(
+    def build_remark(self, data: Dict, include_asn_name: bool) -> str:
+        as_info = data.get("as_info") or {}
+
+        usage_type = (data.get("usage_type") or "").strip().lower()
+        as_usage_type = ((as_info.get("as_usage_type") if isinstance(as_info, dict) else "") or "").strip().lower()
+
+        check = lambda usage: usage.startswith("isp") or usage == "mob"
+        label = "家宽" if check(usage_type) and check(as_usage_type) else ""
+
+        country_code = (data.get("country_code") or "").upper()
+        country = (
+            country_name_zh(country_code)
+            or data.get("country_name")
+            or data.get("country", {}).get("name", "")
+            or "未知"
+        )
+
+        provider = (data.get("as", "") or data.get("isp", "") or "").strip()
+        if not provider and as_info and isinstance(as_info, dict):
+            provider = (as_info.get("as_name", "") or as_info.get("as_domain", "")).strip()
+        if not provider:
+            provider = data.get("domain", "").strip() or ""
+
+        company_name = short_company_name(provider)
+        score = str(data.get("fraud_score")).zfill(3) if "fraud_score" in data else "NUL"
+
+        return self._format_remark(
+            country_code=country_code,
+            country=country,
+            label=label,
+            include_asn_name=include_asn_name,
+            company_name=company_name,
+            detail=score,
+        )
+
+    @staticmethod
+    def _extract_data(content: str) -> Dict:
+        if not content or not isinstance(content, str):
+            return {}
+
+        pattern = r'<code\b[^>]*class=["\'][^"\']*\blanguage-json\b[^"\']*["\'][^>]*>(.*?)</code>\s*</pre>'
+        groups = re.findall(pattern, content, flags=re.I | re.S)
+        if not groups:
+            return {}
+
+        for group in groups:
+            payload = group.strip()
+            if not payload:
+                continue
+
+            payload = re.sub(r"<[^>]+>", "", payload, flags=re.I | re.S)
+            payload = html.unescape(payload)
+
+            try:
+                data = json.loads(payload)
+                if isinstance(data, dict):
+                    return data
+            except Exception:
+                continue
+
+        return {}
+
+    async def _fetch(
+        self, session: aiohttp.ClientSession, _: ProxyInfo, retries: int, timeout: int
+    ) -> Tuple[Optional[Dict], Optional[str]]:
+        url = "https://www.ip2location.com/demo"
+        headers = {"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"}
+        data, error = await self._make_request(
             session=session,
-            proxy_info=proxy_info,
+            url=url,
             retries=retries,
             timeout=timeout,
-            source=self.name,
-            fetcher=self._fetch_iplark,
+            headers=headers,
+            deserialize=False,
+            parser=self._extract_data,
         )
+        if not data:
+            return None, "Invalid HTML response" if error == "Invalid response payload" else error
+
+        return data, None
+
+
+class IPLarkLibrary(IPLibrary):
+    name = "iplark"
 
     def build_remark(self, data: Dict, include_asn_name: bool) -> str:
         node_type = (data.get("type") or "").strip().lower()
@@ -606,22 +705,23 @@ class IPLarkLibrary(IpLibrary):
             detail=detail,
         )
 
-    async def _fetch_iplark(
-        self, session: aiohttp.ClientSession, retries: int, timeout: int
+    async def _fetch(
+        self, session: aiohttp.ClientSession, _: ProxyInfo, retries: int, timeout: int
     ) -> Tuple[Optional[Dict], Optional[str]]:
         url = "https://iplark.com/ipapi/public/ipinfo"
         return await self._make_request(session, url, retries, timeout)
 
 
 IP_LIBRARIES = {
+    "ip2location": IP2LocationLibrary,
     "iplark": IPLarkLibrary,
-    "ipinfo": IpinfoLibrary,
-    "ippure": IppureLibrary,
+    "ipinfo": IPInfoLibrary,
+    "ippure": IPPureLibrary,
 }
 
 
-def get_ip_library(name: str) -> IpLibrary:
-    key = (name or "iplark").strip().lower()
+def get_ip_library(name: str) -> IPLibrary:
+    key = (name or "ip2location").strip().lower()
     library = IP_LIBRARIES.get(key)
     if not library:
         supported = ", ".join(sorted(IP_LIBRARIES.keys()))
@@ -637,7 +737,7 @@ class ProxyChecker:
         format_pattern: Optional[str] = None,
         default_port: int = 1080,
         include_asn_name: bool = False,
-        ip_library: str = "iplark",
+        ip_library: str = "ip2location",
     ):
         """
         初始化代理检测器
@@ -663,7 +763,7 @@ class ProxyChecker:
         解析代理字符串，支持自定义格式
 
         支持的格式占位符:
-        - {protocol}: 协议类型 (socks5/socks4/http等)
+        - {protocol}: 协议类型 (socks5/socks4/http/https等)
         - {username}: 用户名
         - {password}: 密码
         - {host}: 主机地址
@@ -705,10 +805,7 @@ class ProxyChecker:
                 prefix = f"socks5://{prefix}"
 
             result = urlparse(prefix)
-
             protocol = result.scheme or "socks5"
-            if protocol == "https":
-                protocol = "http"
 
             return ProxyInfo(
                 protocol=protocol,
@@ -795,9 +892,6 @@ class ProxyChecker:
             elif placeholder == "host":
                 host = value
 
-        if protocol == "https":
-            protocol = "http"
-
         return ProxyInfo(
             protocol=protocol,
             username=username,
@@ -813,20 +907,20 @@ class ProxyChecker:
         Test a single proxy with retries.
         """
         result = TestResult.from_proxy(proxy_info)
-
-        # Build proxy URL
-        if proxy_info.username and proxy_info.password:
-            proxy_url = (
-                f"{proxy_info.protocol}://{proxy_info.username}:{proxy_info.password}"
-                f"@{proxy_info.host}:{proxy_info.port}"
-            )
-        else:
-            proxy_url = f"{proxy_info.protocol}://{proxy_info.host}:{proxy_info.port}"
-
         start_time = datetime.now()
         try:
-            connector = ProxyConnector.from_url(proxy_url)
-            async with aiohttp.ClientSession(connector=connector) as session:
+            protocol = (proxy_info.protocol or "").lower()
+            if protocol in ("http", "https"):
+                proxy_url = self._build_proxy_url(proxy_info, include_auth=False)
+                proxy_auth = self._build_proxy_auth(proxy_info)
+                connector = aiohttp.TCPConnector(ssl=False)
+                session = aiohttp.ClientSession(connector=connector, proxy=proxy_url, proxy_auth=proxy_auth)
+            else:
+                proxy_url = self._build_proxy_url(proxy_info, include_auth=True)
+                connector = ProxyConnector.from_url(proxy_url)
+                session = aiohttp.ClientSession(connector=connector)
+
+            async with session:
                 lookup = await self.ip_library.lookup(session, proxy_info, retries, self.timeout)
                 if not lookup.ip or not lookup.data:
                     result.error = lookup.error or f"Failed to get IP info from {self.ip_library.name}"
@@ -858,18 +952,37 @@ class ProxyChecker:
             return f"{base}#{remark}"
         return base
 
+    def _build_proxy_url(self, proxy_info: ProxyInfo, include_auth: bool) -> str:
+        auth = ""
+        if include_auth and (proxy_info.username or proxy_info.password):
+            username = quote(proxy_info.username or "", safe="")
+            password = quote(proxy_info.password or "", safe="")
+            auth = f"{username}:{password}@"
+
+        return f"{proxy_info.protocol}://{auth}{proxy_info.host}:{proxy_info.port}"
+
+    def _build_proxy_auth(self, proxy_info: ProxyInfo) -> Optional[aiohttp.BasicAuth]:
+        if not (proxy_info.username or proxy_info.password):
+            return None
+
+        return aiohttp.BasicAuth(proxy_info.username or "", proxy_info.password or "")
+
     def _yaml_quote(self, value: str) -> str:
         escaped = value.replace("\\", "\\\\").replace('"', '\\"')
         return f'"{escaped}"'
 
     def _format_yaml_line(self, result: TestResult) -> str:
         name = result.remark or result.host
+        protocol = (result.protocol or "").lower()
+        clash_type = "http" if protocol == "https" else protocol
         parts = [
             f"name: {self._yaml_quote(name)}",
             f"server: {self._yaml_quote(result.host)}",
             f"port: {result.port}",
-            f"type: {self._yaml_quote(result.protocol)}",
+            f"type: {self._yaml_quote(clash_type)}",
         ]
+        if protocol == "https":
+            parts.append("tls: true")
         if result.username:
             parts.append(f"username: {self._yaml_quote(result.username)}")
         if result.password:
@@ -1153,8 +1266,8 @@ def read_proxies(filepath: str) -> List[str]:
                     return None
 
             protocol = str(entry.get("type") or "socks5").strip().lower()
-            if protocol == "https":
-                protocol = "http"
+            if protocol == "http" and entry.get("tls") is True:
+                protocol = "https"
             elif protocol == "socks":
                 protocol = "socks5"
 
@@ -1278,7 +1391,7 @@ async def main():
   %(prog)s -f proxies.txt --input-format "socks5://{host}:{port}:{username}:{password}"
 
 支持的格式占位符:
-  {protocol}  - 协议类型 (socks5/socks4/http等)
+  {protocol}  - 协议类型 (socks5/socks4/http/https等)
   {username}  - 用户名
   {password}  - 密码
   {host}      - 主机地址/IP
@@ -1316,8 +1429,8 @@ async def main():
         "--ip-library",
         dest="ip_library",
         choices=sorted(IP_LIBRARIES.keys()),
-        default="iplark",
-        help="IP地址数据库服务商: iplark、ipinfo 或 ippure (默认: iplark)",
+        default="ip2location",
+        help="IP地址数据库服务商: ip2location、iplark、ipinfo 或 ippure (默认: ip2location)",
     )
 
     args = parser.parse_args()

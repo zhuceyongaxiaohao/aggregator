@@ -3,6 +3,7 @@
 # @Author  : wzdnzd
 # @Time    : 2024-07-12
 
+import html
 import json
 import math
 import os
@@ -17,6 +18,7 @@ import urllib.parse
 import urllib.request
 from collections import defaultdict
 from dataclasses import dataclass
+from functools import partial
 
 import utils
 import yaml
@@ -834,7 +836,7 @@ def random_delay(min_delay: float = 0.01, max_delay: float = 0.5):
     time.sleep(random.uniform(min_delay, max_delay))
 
 
-def check_residential(proxy: dict, port: int, api_key: str = "", ip_library: str = "iplark") -> ProxyQueryResult:
+def check_residential(proxy: dict, port: int, api_key: str = "", ip_library: str = "ip2location") -> ProxyQueryResult:
     """
     Check if a proxy is residential by making a request through it
 
@@ -842,7 +844,7 @@ def check_residential(proxy: dict, port: int, api_key: str = "", ip_library: str
         proxy: The proxy information dict
         port: The port of the proxy
         api_key: Optional API key for ipapi.is. Uses free tier if not provided
-        ip_library: IP query provider, supported: iplark/ipinfo/ipapi (default: iplark)
+        ip_library: IP query provider, supported: ip2location/iplark/ipinfo/ippure/ipapi (default: ip2location)
 
     Returns:
         ProxyQueryResult: Complete proxy query result
@@ -877,15 +879,17 @@ def check_residential(proxy: dict, port: int, api_key: str = "", ip_library: str
             return url
         elif provider == "ippure":
             return "https://my.ippure.com/v1/info"
+        elif provider == "ip2location":
+            return "https://www.ip2location.com/demo"
 
         return "https://iplark.com/ipapi/public/ipinfo"
 
     def _get_providers(preferred: str) -> list[str]:
-        candidates = ["iplark", "ipinfo", "ippure", "ipapi"]
+        candidates = ["ip2location", "iplark", "ippure", "ipinfo", "ipapi"]
 
         library = utils.trim(preferred).lower()
         if library not in candidates:
-            library = "iplark"
+            library = "ip2location"
 
         providers = [library]
         for item in candidates:
@@ -894,7 +898,7 @@ def check_residential(proxy: dict, port: int, api_key: str = "", ip_library: str
 
         return providers
 
-    def _extract_data(provider: str, response: dict) -> tuple[dict, str, str, str]:
+    def _parse_data(provider: str, response: dict) -> tuple[dict, str, str, str]:
         data, country_code, company_type, asn_type = {}, "", "", ""
 
         if provider == "ipinfo":
@@ -916,6 +920,18 @@ def check_residential(proxy: dict, port: int, api_key: str = "", ip_library: str
                 company_type, asn_type = "isp", "isp"
             else:
                 company_type, asn_type = "hosting", "hosting"
+        elif provider == "ip2location":
+            data = response if isinstance(response, dict) else {}
+            country_code = data.get("country_code", "")
+
+            usage_type = utils.trim(data.get("usage_type", "")).lower()
+            as_usage_type = utils.trim(data.get("as_info", {}).get("as_usage_type", "")).lower()
+
+            check = lambda usage: usage.startswith("isp") or usage == "mob"
+            if check(usage_type) and check(as_usage_type):
+                company_type, asn_type = "isp", "isp"
+            else:
+                company_type, asn_type = "hosting", "hosting"
         else:
             data = response if isinstance(response, dict) else {}
             country_code = data.get("country_code", "")
@@ -929,6 +945,32 @@ def check_residential(proxy: dict, port: int, api_key: str = "", ip_library: str
                 company_type, asn_type = "hosting", "hosting"
 
         return data, utils.trim(country_code).upper(), utils.trim(company_type).lower(), utils.trim(asn_type).lower()
+
+    def _extract_ip2location_data(content: str) -> dict:
+        """Extract JSON payload from ip2location demo HTML response."""
+        if not content or not isinstance(content, str):
+            return {}
+
+        pattern = r'<code\b[^>]*class=["\'][^"\']*\blanguage-json\b[^"\']*["\'][^>]*>(.*?)</code>\s*</pre>'
+        groups = re.findall(pattern, content, flags=re.I | re.S)
+        if not groups:
+            return {}
+
+        for group in groups:
+            payload = utils.trim(group)
+            if not payload:
+                continue
+
+            # Some syntax highlighters may inject tags into the JSON block.
+            payload = re.sub(r"<[^>]+>", "", payload, flags=re.I | re.S)
+            payload = html.unescape(payload)
+
+            try:
+                return json.loads(payload)
+            except Exception:
+                continue
+
+        return {}
 
     name = proxy.get("name", "")
     result = ProxyInfo(name=name)
@@ -950,9 +992,29 @@ def check_residential(proxy: dict, port: int, api_key: str = "", ip_library: str
                 continue
 
             # Call API for IP information through the proxy
-            success, response = make_proxy_request(port=port, url=url, max_retries=2, timeout=12)
+            deserialize, headers = True, None
+            if item == "ip2location":
+                headers = {"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"}
+                deserialize = False
+
+            success, response = make_proxy_request(
+                port=port,
+                url=url,
+                max_retries=2,
+                timeout=12,
+                headers=headers,
+                deserialize=deserialize,
+            )
+
+            if success and item == "ip2location":
+                response = _extract_ip2location_data(response)
+                success = isinstance(response, dict) and bool(response)
+                if not success:
+                    logger.warning(f"Failed to extract JSON payload from ip2location demo HTML for proxy {name}")
+
             if success:
                 provider = item
+                logger.debug(f"IP infor for proxy {name} successfully retrieved, provider: {provider}")
                 break
 
             if idx < len(providers) - 1:
@@ -964,13 +1026,15 @@ def check_residential(proxy: dict, port: int, api_key: str = "", ip_library: str
         # Parse data from response
         if success:
             try:
-                data, country_code, company_type, asn_type = _extract_data(provider, response)
+                data, country_code, company_type, asn_type = _parse_data(provider, response)
 
                 if country_code:
                     result.country = ISO_TO_CHINESE.get(country_code, "")
 
                 if not result.country:
-                    result.country = utils.trim(data.get("country_zh", "") or data.get("country", ""))
+                    result.country = utils.trim(
+                        data.get("country_zh", "") or data.get("country", "") or data.get("country_name", "")
+                    )
 
                 # Check if it's residential (both company and asn type should be "isp")
                 if company_type == "isp" and asn_type == "isp":
@@ -1235,6 +1299,7 @@ def regularize(
     show_progress: bool = True,
     locate: bool = False,
     residential: bool = False,
+    ip_library: str = "",
     digits: int = 2,
 ) -> list[dict]:
     if not proxies or not isinstance(proxies, list):
@@ -1255,7 +1320,7 @@ def regularize(
         # Use mihomo to check for residential proxies
         results = batch_query(
             proxies=proxies,
-            func=check_residential,
+            func=partial(check_residential, ip_library=ip_library),
             num_threads=num_threads,
             show_progress=show_progress,
             description="Checking residential",
